@@ -57,6 +57,11 @@ Para demostrar la robustez y capacidad de las tecnologías nativas de los navega
 
 Al ser una aplicación **web frontend pura (HTML + CSS + JavaScript vanilla)**, no requiere servidores, compiladores ni dependencias de Node.js:
 
+### Online (GitHub Pages)
+Abre directamente en tu navegador:  
+[https://matiasluce.github.io/ITES-DFD](https://matiasluce.github.io/ITES-DFD)
+
+### Local
 1. Clona este repositorio o descarga los archivos (`index.html`, `style.css`, `script.js`).
 2. Abre `index.html` directamente en tu navegador de preferencia (Chrome, Edge, Firefox, Safari).
 3. ¡Comienza a estructurar tus diagramas!
