@@ -8,14 +8,17 @@ const PAD_V      = 18;
 const MIN_W      = 150;
 const MIN_H_NORM = 52;
 const MIN_H_DEC  = 72;
-const V_GAP      = 40;
-const H_GAP      = 80;   // horizontal gap for decision branches
-const COL_X      = 380;  // center x of main chain
-const SIDE_STUB  = 34;   // how far SI/NO lines stick out to the side before turning down
+const V_GAP      = 40;   // vertical gap between nodes
+const BRANCH_H_PAD = 50; // horizontal clearance between branch column and decision center
+const COL_X      = 440;  // center x of main chain
 
 const ZOOM_MIN  = 0.3;
 const ZOOM_MAX  = 2;
 const ZOOM_STEP = 0.1;
+
+// Per-decision layout info, filled by autoLayout, used by mountArrow
+// decId → { noCenterX, siCenterX, branchTopY, mergeY, mergeNodeId }
+const decisionLayout = {};
 
 // ═══════════════════════════════════════════════════════
 //  STATE
@@ -146,8 +149,17 @@ function updateNodePos(node) {
 }
 
 // ═══════════════════════════════════════════════════════
-//  ARROW DOM
+//  ARROW DOM  —  clean top/bottom-only router
 // ═══════════════════════════════════════════════════════
+
+// Only top and bottom ports used
+function getPortTB(node, dir) {
+  const cx = node.x + node.w / 2;
+  if (dir === 'top')    return { x: cx, y: node.y };
+  return { x: cx, y: node.y + node.h }; // bottom (default)
+}
+
+// Keep getPort for legacy calls in saveDiagram
 function getPort(node, dir) {
   const cx = node.x + node.w / 2, cy = node.y + node.h / 2;
   if (dir === 'top')    return { x: cx, y: node.y };
@@ -157,60 +169,44 @@ function getPort(node, dir) {
 }
 
 function bestDirs(src, dst) {
-  const dy = (dst.y + dst.h/2) - (src.y + src.h/2);
-  const dx = (dst.x + dst.w/2) - (src.x + src.w/2);
-  if (Math.abs(dy) >= Math.abs(dx)) return dy >= 0 ? ['bottom','top'] : ['top','bottom'];
-  return dx >= 0 ? ['right','left'] : ['left','right'];
+  return ['bottom','top'];
 }
 
-// For an arrow ending at `dst` via its top port, figure out whether it is the
-// final segment of a decision's SI or NO branch (whether or not that branch
-// passes through inserted shapes first). Returns 'left' | 'right' | null —
-// matching the originating srcPort of the branch — so converging SI/NO lines
-// that both land on the same node's top port can be offset apart instead of
-// drawing two arrowheads on the exact same pixel.
-function findBranchSideForArrow(arrow) {
-  if (arrow.dstPort !== 'top') return null;
-  // Direct branch: the arrow itself leaves a decision via left/right.
-  if ((arrow.srcPort === 'left' || arrow.srcPort === 'right')) {
-    const src = nodes.find(n => n.id === arrow.srcId);
-    if (src && src.type === 'decision') return arrow.srcPort;
-  }
-  // Otherwise, walk backwards through the chain to see if it originates
-  // from a decision's left/right port without passing through another merge.
-  let cur = arrow;
+function ptsToPath(pts) {
+  return 'M' + pts.map(p => p[0] + ',' + p[1]).join(' L');
+}
+function dedup(pts) {
+  return pts.filter((p, i, a) => i === 0 || p[0] !== a[i-1][0] || p[1] !== a[i-1][1]);
+}
+
+// Walk backward from an arrow to find the decision that started this branch
+// Returns { decId, side:'no'|'si' } or null
+function getBranchInfo(arrow) {
   const seen = new Set();
+  let cur = arrow;
   while (cur && !seen.has(cur.id)) {
     seen.add(cur.id);
-    const src = nodes.find(n => n.id === cur.srcId);
-    if (src && src.type === 'decision' && (cur.srcPort === 'left' || cur.srcPort === 'right')) {
-      return cur.srcPort;
+    if (cur.srcPort === 'left' || cur.srcPort === 'right') {
+      const s = nodes.find(n => n.id === cur.srcId);
+      if (s && s.type === 'decision') {
+        return { decId: s.id, side: cur.srcPort === 'left' ? 'no' : 'si' };
+      }
     }
-    // Step back: find the arrow that feeds into cur's source node, but only
-    // if that source node has exactly one incoming arrow (i.e. is purely
-    // part of this branch's linear chain, not itself a convergence point).
-    const incomingToSrc = arrows.filter(a => a.dstId === cur.srcId);
-    if (incomingToSrc.length !== 1) return null;
-    cur = incomingToSrc[0];
+    const inc = arrows.filter(a => a.dstId === cur.srcId);
+    if (inc.length !== 1) return null;
+    cur = inc[0];
   }
   return null;
 }
 
-// Given a destination node + port, return a small x-offset to apply so that
-// converging SI and NO branch arrows land on visually distinct points instead
-// of overlapping. Returns 0 unless both a left-branch and right-branch arrow
-// are found converging on the same node via the same port.
-const CONVERGE_OFFSET = 16;
-function getConvergeOffset(arrow, dst, dd) {
-  if (dd !== 'top') return 0;
-  const side = findBranchSideForArrow(arrow);
-  if (!side) return 0;
-  const others = arrows.filter(a => a.id !== arrow.id && a.dstId === arrow.dstId && a.dstPort === 'top');
-  const hasOpposite = others.some(a => findBranchSideForArrow(a) === (side === 'left' ? 'right' : 'left'));
-  if (!hasOpposite) return 0;
-  // NO branches approach from the left, so they enter left-of-center; SI from the right.
-  return side === 'left' ? -CONVERGE_OFFSET : CONVERGE_OFFSET;
+// Legacy compatibility shim used by saveDiagram
+function findBranchSideForArrow(arrow) {
+  const info = getBranchInfo(arrow);
+  if (!info) return null;
+  return info.side === 'no' ? 'left' : 'right';
 }
+
+function resetConvergeCache() {} // no longer needed, kept for compat
 
 function mountArrow(arrow) {
   const svgEl = document.getElementById('arrows');
@@ -218,219 +214,231 @@ function mountArrow(arrow) {
   if (!g) {
     g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
     g.id = arrow.id;
-    g.style.cursor = 'pointer';
     g.style.pointerEvents = 'auto';
     svgEl.appendChild(g);
   }
-  // Rebuilt on every render: the merge-bar hit area (if any) needs to know
-  // the CURRENT sibling arrow id, so the whole listener set is reattached
-  // fresh each time rather than reused from a stale closure.
   g.replaceChildren();
 
   const src = nodes.find(n => n.id === arrow.srcId);
   const dst = nodes.find(n => n.id === arrow.dstId);
   if (!src || !dst) return;
 
-  // If arrow has explicit ports, use them; otherwise auto-detect
-  const sd = arrow.srcPort || bestDirs(src, dst)[0];
-  const dd = arrow.dstPort || bestDirs(src, dst)[1];
-  const sp = getPort(src, sd), dp = getPort(dst, dd);
-
   const sel = selectedArrowId === arrow.id;
   const col = sel ? '#f0a500' : '#5b9cf6';
   const mk  = sel ? 'url(#ahs)' : 'url(#ah)';
 
-  // Any SI/NO branch leaving a decision via its left/right port always exits
-  // with a short side "stub" before turning down — this matches the reference
-  // design and keeps the SI and NO lines visually distinct from each other,
-  // whether or not the sibling branch shares the same destination.
-  let isDecisionBranch = false, isMergedBranch = false, siblingPort = null, mergeSiblingArrowId = null;
-  if ((sd === 'left' || sd === 'right') && src.type === 'decision') {
-    isDecisionBranch = true;
-    siblingPort = sd === 'left' ? 'right' : 'left';
-    const sibling = arrows.find(a => a.srcId === src.id && a.dstId === dst.id && a.srcPort === siblingPort);
-    if (sibling) { isMergedBranch = true; mergeSiblingArrowId = sibling.id; }
+  // ── Geometry ─────────────────────────────────────────────
+  const srcCx  = src.x + src.w / 2;
+  const srcBot = src.y + src.h;
+  const srcCy  = src.y + src.h / 2;
+  const dstCx  = dst.x + dst.w / 2;
+  const dstTop = dst.y;
+  const decLeftX  = src.x;
+  const decRightX = src.x + src.w;
+
+  // ── Classify ─────────────────────────────────────────────
+  const isDecBranch = (arrow.srcPort === 'left' || arrow.srcPort === 'right')
+                      && src.type === 'decision';
+  const dl = isDecBranch ? decisionLayout[src.id] : null;
+
+  // ── Find the IMMEDIATE decision that owns this arrow's branch chain ──────
+  // Walks backward and returns the FIRST (closest) decision found via left/right port.
+  // This means each nested decision handles its own merge bar independently.
+  function getImmediateDecId(a) {
+    const seen = new Set();
+    let cur = a;
+    while (cur && !seen.has(cur.id)) {
+      seen.add(cur.id);
+      if (cur.srcPort === 'left' || cur.srcPort === 'right') {
+        const s = nodes.find(n => n.id === cur.srcId);
+        if (s && s.type === 'decision') return s.id; // stop at FIRST decision found
+      }
+      const incs = arrows.filter(x => x.dstId === cur.srcId);
+      if (incs.length !== 1) break;
+      cur = incs[0];
+    }
+    return null;
   }
 
-  // Converging SI/NO branches that are NOT a pure direct merge (i.e. at least
-  // one side passes through its own inserted shape before reaching the
-  // shared destination) must still visually JOIN into a single line above the
-  // destination, just like a pure merge does — not draw two separate
-  // arrowheads side by side, and not bend at two different heights (which
-  // makes the "join" look like it happens at a random point). We find the
-  // "stop" side (NO/left — its line simply ends flush at the shared bend
-  // point, no arrowhead) and the "through" side (SI/right — its line
-  // continues straight down from that same bend point into the
-  // destination's top port, carrying the only arrowhead). Both sides bend
-  // at exactly the same height so the join reads as one clean line.
-  let mergeRole = null, mergePartner = null;
-  if (!isMergedBranch && dd === 'top') {
-    const side = findBranchSideForArrow(arrow);
-    if (side) {
-      mergePartner = arrows.find(a => a.id !== arrow.id && a.dstId === arrow.dstId && a.dstPort === 'top' &&
-        findBranchSideForArrow(a) === (side === 'left' ? 'right' : 'left'));
-      if (mergePartner) { mergeRole = side === 'left' ? 'stop' : 'through'; mergeSiblingArrowId = mergePartner.id; }
+  const myRootDecId = getImmediateDecId(arrow);
+
+  // All arrows arriving at dst that belong to the same immediate decision
+  const allSameRoot = myRootDecId
+    ? arrows.filter(a => a.dstId === dst.id && getImmediateDecId(a) === myRootDecId)
+    : [];
+
+  // Direct branch exits (left/right port of that decision)
+  const directBranches = allSameRoot.filter(a => {
+    const s = nodes.find(n => n.id === a.srcId);
+    return (a.srcPort === 'left' || a.srcPort === 'right') && s && s.id === myRootDecId;
+  });
+
+  const isConverging = directBranches.length >= 2 && allSameRoot.some(a => a.id === arrow.id);
+
+  // ── Compute mergeBarY ────────────────────────────────────
+  // Read from decisionLayout (computed by autoLayout, always correct).
+  // NOT clamped to dst position — dst can be dragged freely below the bar.
+  let mergeBarY = dstTop - V_GAP; // safe fallback for non-converging arrows
+
+  if (isConverging && myRootDecId) {
+    const rdl = decisionLayout[myRootDecId];
+    if (rdl && rdl.mergeBarY != null) {
+      mergeBarY = rdl.mergeBarY;
+    } else {
+      // decisionLayout not yet populated (first render before autoLayout)
+      // Fall back to a position above dst
+      mergeBarY = dstTop - Math.round(V_GAP * 1.5);
     }
   }
-  const mergeX = dp.x;
-  // mergeBendY: altura donde las dos ramas se unen horizontalmente antes de bajar al destino.
-  // Calculamos primero el candidato ideal y luego lo acotamos para que nunca quede
-  // encima ni dentro del nodo destino (dp.y - 12 garantiza al menos 12 px de espacio).
-  let mergeBendY = dst.y - 18;
-  if (mergeRole && mergePartner) {
-    const partnerSrc = nodes.find(n => n.id === mergePartner.srcId);
-    if (partnerSrc) {
-      mergeBendY = Math.max(src.y + src.h, partnerSrc.y + partnerSrc.h) + V_GAP / 2;
-    }
+
+  // ── iAmThrough: only one arrow draws the final arrowhead into dst ─────────
+  // Pick the SI-side (right) direct branch arrow as the "through" arrow.
+  let iAmThrough = !isConverging; // single arrows always draw head
+  if (isConverging) {
+    // Prefer the SI direct branch; among ties pick rightmost source x
+    let throughId = directBranches[0]?.id ?? arrow.id;
+    let best = -Infinity;
+    allSameRoot.forEach(a => {
+      const info = getBranchInfo(a);
+      const s = nodes.find(n => n.id === a.srcId);
+      const score = (info && info.side === 'si' ? 10000 : 0) + (s ? s.x + s.w / 2 : 0);
+      if (score > best) { best = score; throughId = a.id; }
+    });
+    iAmThrough = (arrow.id === throughId);
   }
-  // Safety clamp: nunca sobrepasar el top del nodo destino
-  mergeBendY = Math.min(mergeBendY, dp.y - 12);
 
-  let pathD, labelX, labelY, drawArrowhead = true;
-  let mergeBarSeg = null; // [x1, x2, y] of this arrow's half of the SI/NO join bar, if any
+  // ── Build path ──────────────────────────────────────────
+  let pathD, labelX, labelY, drawHead = true;
 
-  if (isMergedBranch) {
-    const cy    = src.y + src.h / 2;
-    const cx    = src.x + src.w / 2;
-    // mY: punto de doblez horizontal donde ambas ramas convergen.
-    // Nunca puede sobrepasar el nodo destino (dp.y - 12) para evitar
-    // que la línea se doble dentro o encima del nodo cuando las ramas están vacías.
-    const mY    = Math.min(src.y + src.h + V_GAP / 2, dp.y - 12);
-    const sideX = sd === 'left' ? src.x - SIDE_STUB : src.x + src.w + SIDE_STUB;
+  if (isDecBranch) {
+    // Exits from side vertex of diamond → horizontal to column → down → (converging: bar; else: into dst)
+    const vertexX = arrow.srcPort === 'left' ? decLeftX : decRightX;
+    const colX = dl
+      ? (arrow.srcPort === 'left' ? dl.noCenterX : dl.siCenterX)
+      : (arrow.srcPort === 'left' ? src.x - 100 : src.x + src.w + 100);
 
-    if (sd === 'left') {
-      // Rama NO: sale izquierda, baja hasta mY, llega al centro horizontal — sin flecha
-      pathD = `M${sp.x},${sp.y} L${sideX},${cy} L${sideX},${mY} L${cx},${mY}`;
-      drawArrowhead = false;
+    // Label just outside the vertex
+    labelX = arrow.srcPort === 'left' ? vertexX - 28 : vertexX + 28;
+    labelY = srcCy - 13;
+
+    if (isConverging) {
+      const pts = dedup([
+        [vertexX, srcCy],
+        [colX,    srcCy],
+        [colX,    mergeBarY],
+        [dstCx,   mergeBarY],
+      ]);
+      if (iAmThrough) pts.push([dstCx, dstTop]);
+      drawHead = iAmThrough;
+      pathD = ptsToPath(pts);
     } else {
-      // Rama SI: sale derecha, baja hasta mY, cruza al centro, baja al destino.
-      // Filtramos duplicados consecutivos para que el arrowhead apunte siempre hacia abajo.
-      const pts = [
-        [sp.x, sp.y],
-        [sideX, cy],
-        [sideX, mY],
-        [cx, mY],
-        [cx, dp.y],
-        [dp.x, dp.y]
-      ].filter((p, i, arr) => i === 0 || p[0] !== arr[i-1][0] || p[1] !== arr[i-1][1]);
-      pathD = 'M' + pts.map(p => p.join(',')).join(' L');
-      drawArrowhead = true;
+      // No convergence: goes straight to dst via a stair-step
+      const turnY = dstTop - Math.round(V_GAP / 2);
+      const pts = dedup([
+        [vertexX, srcCy],
+        [colX,    srcCy],
+        [colX,    turnY],
+        [dstCx,   turnY],
+        [dstCx,   dstTop],
+      ]);
+      pathD = ptsToPath(pts);
+      drawHead = true;
     }
-    labelX = (sp.x + sideX) / 2;
-    labelY = cy - 10;
-    // La barra de unión va desde el stub lateral hasta el centro de la decisión
-    mergeBarSeg = [sideX, cx, mY];
-  } else if (isDecisionBranch) {
-    // Branch leaving a decision via a side stub. Always finish with a
-    // straight vertical drop into the destination's port (never a sideways
-    // entry) so the arrowhead points cleanly downward: turn from the side
-    // stub onto the destination's x BEFORE descending, so the final segment
-    // is always vertical. If this branch converges with its sibling further
-    // down (mergeRole set), bend at the shared mergeBendY instead.
-    const cy      = src.y + src.h / 2;
-    const sideX   = sd === 'left' ? src.x - SIDE_STUB : src.x + src.w + SIDE_STUB;
-    let pts;
-    if (mergeRole) {
-      pts = [[sp.x, sp.y], [sideX, cy], [sideX, mergeBendY], [mergeX, mergeBendY]];
-      if (mergeRole === 'through') pts.push([dp.x, dp.y]);
-      drawArrowhead = mergeRole === 'through';
-      mergeBarSeg = [sideX, mergeX, mergeBendY];
-    } else {
-      // No convergence: ir de sp al punto de quiebre y luego a dp.x.
-      // Solo usamos el stub (sideX) si el destino está más allá de él en la misma
-      // dirección — si está más cerca, saltamos el stub para evitar que la línea
-      // se extienda innecesariamente lejos del nodo antes de doblar.
-      const useStub = sd === 'left' ? dp.x <= sideX : dp.x >= sideX;
-      const turnX = useStub ? sideX : sp.x;
-      pts = [[sp.x, sp.y], [turnX, cy], [dp.x, cy], [dp.x, dp.y]];
-    }
-    pathD = 'M' + pts.filter((p, i, arr) => i === 0 || p[0] !== arr[i-1][0] || p[1] !== arr[i-1][1]).map(p => p.join(',')).join(' L');
-    labelX = sideX + (sd === 'left' ? -14 : 14);
-    labelY = cy - 10;
-  } else if (sd === 'left' || sd === 'right') {
-    // Elbow: go horizontal then vertical, always ending with a vertical drop
-    let pts;
-    if (mergeRole) {
-      pts = [[sp.x, sp.y], [mergeX, sp.y], [mergeX, mergeBendY]];
-      if (mergeRole === 'through') pts.push([dp.x, dp.y]);
-      drawArrowhead = mergeRole === 'through';
-      mergeBarSeg = [sp.x, mergeX, mergeBendY];
-    } else {
-      pts = [[sp.x, sp.y], [dp.x, sp.y], [dp.x, dp.y]];
-    }
-    pathD = 'M' + pts.filter((p, i, arr) => i === 0 || p[0] !== arr[i-1][0] || p[1] !== arr[i-1][1]).map(p => p.join(',')).join(' L');
-    labelX = (sp.x + dp.x) / 2;
-    labelY = sp.y - 10;
-  } else if (sp.x === dp.x && !mergeRole) {
-    // Perfectly aligned vertically — single straight line
-    pathD = `M${sp.x},${sp.y} L${dp.x},${dp.y}`;
-    labelX = (sp.x + dp.x) / 2;
-    labelY = (sp.y + dp.y) / 2 - 8;
+
+  } else if (isConverging) {
+    // Node inside a branch converges to dst (e.g. "Proceso → Fin")
+    // Goes straight down from its bottom to mergeBarY, then across to dstCx
+    const pts = dedup([
+      [srcCx, srcBot],
+      [srcCx, mergeBarY],
+      [dstCx, mergeBarY],
+    ]);
+    if (iAmThrough) pts.push([dstCx, dstTop]);
+    drawHead = iAmThrough;
+    pathD = ptsToPath(pts);
+    labelX = srcCx;
+    labelY = (srcBot + mergeBarY) / 2 - 8;
+
+  } else if (Math.abs(srcCx - dstCx) < 3) {
+    // Straight vertical
+    pathD = `M${srcCx},${srcBot} L${dstCx},${dstTop}`;
+    labelX = srcCx;
+    labelY = (srcBot + dstTop) / 2 - 8;
+    drawHead = true;
+
   } else {
-    // Vertical-ish but offset horizontally — straight elbow (no curve), always ending vertically.
-    // If converging with a sibling branch, bend at the shared mergeBendY instead of the midpoint.
-    let pts;
-    if (mergeRole) {
-      pts = [[sp.x, sp.y], [sp.x, mergeBendY], [mergeX, mergeBendY]];
-      if (mergeRole === 'through') pts.push([dp.x, dp.y]);
-      drawArrowhead = mergeRole === 'through';
-      mergeBarSeg = [sp.x, mergeX, mergeBendY];
-    } else {
-      const my = (sp.y + dp.y) / 2;
-      pts = [[sp.x, sp.y], [sp.x, my], [dp.x, my], [dp.x, dp.y]];
-    }
-    pathD = 'M' + pts.filter((p, i, arr) => i === 0 || p[0] !== arr[i-1][0] || p[1] !== arr[i-1][1]).map(p => p.join(',')).join(' L');
-    labelX = (sp.x + dp.x) / 2;
-    labelY = (sp.y + dp.y) / 2 - 8;
+    // Stair-step
+    const midY = Math.round((srcBot + dstTop) / 2);
+    pathD = ptsToPath(dedup([[srcCx, srcBot], [srcCx, midY], [dstCx, midY], [dstCx, dstTop]]));
+    labelX = (srcCx + dstCx) / 2;
+    labelY = midY - 10;
+    drawHead = true;
   }
 
-  const mk2 = drawArrowhead ? mk : 'none';
+  const mk2 = drawHead ? mk : 'none';
 
+  // ── Label ────────────────────────────────────────────────
   const labelSVG = arrow.label
-    ? `<rect x="${labelX - arrow.label.length*3.5 - 3}" y="${labelY - 10}" width="${arrow.label.length*7 + 6}" height="16" rx="3" fill="#1e2d50" opacity="0.85"/>
+    ? (() => {
+        const lw = arrow.label.length * 7 + 6;
+        return `<rect x="${labelX - lw/2}" y="${labelY - 10}" width="${lw}" height="16" rx="3" fill="#1e2d50" opacity="0.92"/>
        <text x="${labelX}" y="${labelY}" text-anchor="middle" dominant-baseline="central"
-         font-family="Arial,sans-serif" font-size="11" font-weight="700" fill="#7ec8ff">${xmlEsc(arrow.label)}</text>`
+         font-family="Arial,sans-serif" font-size="11" font-weight="700" fill="#7ec8ff">${xmlEsc(arrow.label)}</text>`;
+      })()
     : '';
 
-  g.innerHTML = `
-    <path d="${pathD}" stroke="${col}" stroke-width="2.5" fill="none" marker-end="${mk2}"/>
-    ${labelSVG}`;
+  // ── Render path ──────────────────────────────────────────
+  const visPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  visPath.setAttribute('d', pathD);
+  visPath.setAttribute('stroke', col);
+  visPath.setAttribute('stroke-width', '2.5');
+  visPath.setAttribute('fill', 'none');
+  visPath.setAttribute('marker-end', mk2);
+  g.appendChild(visPath);
 
-  // Hit area for the rest of the line (inserts INSIDE the branch / on the trunk).
-  // Added first so the merge-bar hit area below sits on top of it where they overlap.
-  const lineHit = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-  lineHit.setAttribute('d', pathD);
-  lineHit.setAttribute('stroke', 'transparent');
-  lineHit.setAttribute('stroke-width', '14');
-  lineHit.setAttribute('fill', 'none');
-  lineHit.style.pointerEvents = 'auto';
-  lineHit.addEventListener('click', e => {
+  if (labelSVG) {
+    const tmp = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    tmp.innerHTML = labelSVG;
+    while (tmp.firstChild) g.appendChild(tmp.firstChild);
+  }
+
+  // ── Hit area ─────────────────────────────────────────────
+  const hit = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  hit.setAttribute('d', pathD);
+  hit.setAttribute('stroke', 'transparent');
+  hit.setAttribute('stroke-width', '14');
+  hit.setAttribute('fill', 'none');
+  hit.style.cursor = 'pointer';
+  hit.addEventListener('click', e => {
     e.stopPropagation();
     if (selectedTool) { insertOnArrow(arrow.id); return; }
     selectArrow(arrow.id);
   });
-  g.appendChild(lineHit);
+  g.appendChild(hit);
 
-  // Hit area for the SI/NO join bar (if this arrow has one): a separate
-  // clickable strip covering just the horizontal merge segment, layered on
-  // top of the general line-hit area so it wins where they overlap. Clicking
-  // here inserts the new shape AFTER the merge, outside both decision
-  // branches — distinct from clicking the rest of the line, which inserts
-  // INSIDE the branch as before.
-  if (mergeBarSeg && mergeSiblingArrowId) {
-    const [bx1, bx2, by] = mergeBarSeg;
+  // ── Merge bar hit area (only on the through arrow) ───────
+  if (isConverging && iAmThrough) {
+    // Compute the X span of the merge bar from all converging sources
+    const xs = allSameRoot.map(a => {
+      const s = nodes.find(n => n.id === a.srcId);
+      const info = getBranchInfo(a);
+      if (info && s && s.type === 'decision') {
+        const adl = decisionLayout[s.id];
+        if (adl) return info.side === 'no' ? adl.noCenterX : adl.siCenterX;
+      }
+      return s ? s.x + s.w / 2 : dstCx;
+    });
+    const barX1 = Math.min(...xs), barX2 = Math.max(...xs);
     const barHit = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    barHit.setAttribute('d', `M${bx1},${by} L${bx2},${by}`);
+    barHit.setAttribute('d', `M${barX1},${mergeBarY} L${barX2},${mergeBarY}`);
     barHit.setAttribute('stroke', 'transparent');
-    barHit.setAttribute('stroke-width', '16');
+    barHit.setAttribute('stroke-width', '18');
     barHit.setAttribute('fill', 'none');
-    barHit.style.pointerEvents = 'auto';
-    barHit.style.cursor = selectedTool ? 'crosshair' : 'pointer';
-    const noId = sd === 'left' || mergeRole === 'stop' ? arrow.id : mergeSiblingArrowId;
-    const siId = sd === 'left' || mergeRole === 'stop' ? mergeSiblingArrowId : arrow.id;
+    barHit.style.cursor = 'pointer';
+    const otherArrowId = allSameRoot.find(a => a.id !== arrow.id)?.id || arrow.id;
     barHit.addEventListener('click', e => {
       e.stopPropagation();
-      if (selectedTool) { insertAfterMerge(noId, siId, dst.id); return; }
+      if (selectedTool) { insertAfterMerge(otherArrowId, arrow.id, dst.id); return; }
       selectArrow(arrow.id);
     });
     g.appendChild(barHit);
@@ -455,6 +463,7 @@ function mkArrow(srcId, dstId, label, srcPort, dstPort) {
   const id    = 'a' + (arrowSeq++);
   const arrow = { id, srcId, dstId, label: label || '', srcPort: srcPort||null, dstPort: dstPort||null };
   arrows.push(arrow);
+  resetConvergeCache();
   mountArrow(arrow);
   return arrow;
 }
@@ -540,48 +549,110 @@ function walkBranch(startArrow) {
 
 // ═══════════════════════════════════════════════════════
 //  layoutChain — recursive layout engine
-//  Positions a linear chain starting at `cur`, using centerX as the
-//  horizontal center column and startY as the top. Returns the Y
-//  coordinate immediately after the last node it placed, so the
-//  caller knows where to continue.
+//  Places nodes top-to-bottom in the given center column.
+//  For decisions: places NO branch left, SI branch right,
+//  records column centers in decisionLayout[dec.id].
+//  Returns { endY, minX, maxX }.
 // ═══════════════════════════════════════════════════════
 function layoutChain(cur, centerX, startY, positioned) {
   let y = startY;
+  let minX = Infinity, maxX = -Infinity;
   const seen = new Set();
 
   while (cur && !positioned.has(cur.id)) {
-    if (seen.has(cur.id)) break; // cycle guard
+    if (seen.has(cur.id)) break;
     seen.add(cur.id);
     positioned.add(cur.id);
 
-    cur.x = centerX - cur.w / 2;
-    cur.y = y;
+    cur.x = Math.round(centerX - cur.w / 2);
+    cur.y = Math.round(y);
     updateNodePos(cur);
+    minX = Math.min(minX, cur.x);
+    maxX = Math.max(maxX, cur.x + cur.w);
 
     if (cur.type === 'decision') {
-      const siArrow = arrows.find(a => a.srcId === cur.id && a.srcPort === 'left');
-      const noArrow = arrows.find(a => a.srcId === cur.id && a.srcPort === 'right');
-      const siBranch = siArrow ? walkBranch(siArrow) : { nodes: [], mergeId: null };
+      const noArrow = arrows.find(a => a.srcId === cur.id && a.srcPort === 'left');
+      const siArrow = arrows.find(a => a.srcId === cur.id && a.srcPort === 'right');
       const noBranch = noArrow ? walkBranch(noArrow) : { nodes: [], mergeId: null };
+      const siBranch = siArrow ? walkBranch(siArrow) : { nodes: [], mergeId: null };
 
       const branchTopY = y + cur.h + V_GAP;
 
-      // Left branch (NO): centered to the LEFT of the decision
-      const leftCenterX = centerX - H_GAP - 75; // 75 ≈ half of typical branch node width
-      const ly = layoutBranchNodes(siArrow, siBranch.nodes, leftCenterX, branchTopY, positioned);
+      // ── Dry-run to measure each branch width ───────────────
+      const siDry = layoutBranchNodes(siArrow, centerX, branchTopY, new Set(positioned), true);
+      const noDry = layoutBranchNodes(noArrow, centerX, branchTopY, new Set(positioned), true);
 
-      // Right branch (SI): centered to the RIGHT of the decision
-      const rightCenterX = centerX + H_GAP + 75;
-      const ry = layoutBranchNodes(noArrow, noBranch.nodes, rightCenterX, branchTopY, positioned);
+      const siHalfW = Math.max((siDry.maxX - siDry.minX) / 2, MIN_W / 2);
+      const noHalfW = Math.max((noDry.maxX - noDry.minX) / 2, MIN_W / 2);
 
-      const mergeId = siBranch.mergeId || noBranch.mergeId;
-      y = Math.max(ly, ry, branchTopY);
+      // Branch centers: placed so the inner edge of each branch clears the
+      // decision diamond by BRANCH_H_PAD, and branches don't overlap each other.
+      const decHalfW = cur.w / 2;
+      const siCenterX = centerX + decHalfW + BRANCH_H_PAD + siHalfW;
+      const noCenterX = centerX - decHalfW - BRANCH_H_PAD - noHalfW;
 
+      // ── Real layout ────────────────────────────────────────
+      const siReal = layoutBranchNodes(siArrow, siCenterX, branchTopY, positioned, false);
+      const noReal = layoutBranchNodes(noArrow, noCenterX, branchTopY, positioned, false);
+
+      const bottomY = Math.max(siReal.endY, noReal.endY, branchTopY);
+
+      // Find the deepest mergeBarY among any nested decisions in either branch.
+      // The parent's merge bar must be at or below all child merge bars so lines
+      // can route horizontally outward without crossing children.
+      function deepestChildMergeBarY(branchArrow, guard) {
+        if (!branchArrow || guard.size > 60) return 0;
+        let maxBar = 0;
+        let wCur = nodes.find(n => n.id === branchArrow.dstId);
+        const wSeen = new Set(guard);
+        while (wCur && !wSeen.has(wCur.id)) {
+          wSeen.add(wCur.id);
+          if (wCur.type === 'decision') {
+            const cdl = decisionLayout[wCur.id];
+            if (cdl && cdl.mergeBarY != null) maxBar = Math.max(maxBar, cdl.mergeBarY);
+            // Also recurse into this child's sub-branches
+            const cSi = arrows.find(a => a.srcId === wCur.id && a.srcPort === 'right');
+            const cNo = arrows.find(a => a.srcId === wCur.id && a.srcPort === 'left');
+            if (cSi) maxBar = Math.max(maxBar, deepestChildMergeBarY(cSi, new Set(wSeen)));
+            if (cNo) maxBar = Math.max(maxBar, deepestChildMergeBarY(cNo, new Set(wSeen)));
+            break;
+          }
+          const outA = arrows.find(a => a.srcId === wCur.id && (!a.srcPort || a.srcPort === 'bottom'));
+          if (!outA || outA.dstPort === 'top') break;
+          wCur = nodes.find(n => n.id === outA.dstId);
+        }
+        return maxBar;
+      }
+
+      const childBarSI = siArrow ? deepestChildMergeBarY(siArrow, new Set()) : 0;
+      const childBarNO = noArrow ? deepestChildMergeBarY(noArrow, new Set()) : 0;
+      const deepestChildBar = Math.max(childBarSI, childBarNO);
+
+      // Parent merge bar: at least V_GAP*0.6 below branch content,
+      // but also at or below the deepest child merge bar so outer lines clear inner ones.
+      const naturalBar = bottomY + Math.round(V_GAP * 0.6);
+      const mergeBarYForDec = Math.max(naturalBar, deepestChildBar);
+
+      // Store for arrow router
+      decisionLayout[cur.id] = {
+        noCenterX,
+        siCenterX,
+        branchTopY,
+        mergeY:    bottomY,
+        mergeBarY: mergeBarYForDec,
+        decCenterX: centerX,
+      };
+
+      minX = Math.min(minX, noReal.minX);
+      maxX = Math.max(maxX, siReal.maxX);
+      // Position merge node well below the bar so there's room to insert nodes
+      y = mergeBarYForDec + Math.round(V_GAP * 1.5);
+
+      const mergeId = noBranch.mergeId || siBranch.mergeId;
       if (mergeId && !positioned.has(mergeId)) {
         cur = nodes.find(n => n.id === mergeId);
-      } else {
-        break;
-      }
+      } else { break; }
+
     } else {
       y += cur.h + V_GAP;
       const outArrows = arrows.filter(a => a.srcId === cur.id);
@@ -589,17 +660,20 @@ function layoutChain(cur, centerX, startY, positioned) {
       cur = nextArrow ? nodes.find(n => n.id === nextArrow.dstId) : null;
     }
   }
-  return y;
+  if (minX === Infinity) minX = centerX - MIN_W / 2;
+  if (maxX === -Infinity) maxX = centerX + MIN_W / 2;
+  return { endY: y, minX, maxX };
 }
 
-// Lays out the nodes of a single branch (SI or NO), recursing into any
-// nested decisions. Returns the Y coordinate after the last node placed.
-function layoutBranchNodes(branchStartArrow, branchNodes, centerX, startY, positioned) {
-  if (!branchStartArrow) return startY;
-  // Walk the branch arrow by arrow so nested decisions get recursive treatment
+// Layout nodes of one branch column recursively.
+// dryRun=true: uses a copy of positioned, doesn't commit.
+function layoutBranchNodes(branchStartArrow, centerX, startY, positioned, dryRun) {
+  if (!branchStartArrow) return { endY: startY, minX: centerX - MIN_W/2, maxX: centerX + MIN_W/2 };
   let y = startY;
+  let minX = Infinity, maxX = -Infinity;
   let arrow = branchStartArrow;
   const seen = new Set();
+  const posSet = dryRun ? new Set(positioned) : positioned;
 
   while (arrow && arrow.dstId) {
     if (seen.has(arrow.id)) break;
@@ -607,39 +681,38 @@ function layoutBranchNodes(branchStartArrow, branchNodes, centerX, startY, posit
 
     const nextNode = nodes.find(n => n.id === arrow.dstId);
     if (!nextNode) break;
-    // Stop at the convergence point
     const incoming = arrows.filter(a => a.dstId === nextNode.id);
-    if (incoming.length > 1) break;
-    if (positioned.has(nextNode.id)) break;
+    if (incoming.length > 1) break; // convergence node — stop
+    if (posSet.has(nextNode.id)) break;
 
-    // Use layoutChain for recursive handling of nested decisions
-    y = layoutChain(nextNode, centerX, y, positioned);
+    const r = layoutChain(nextNode, centerX, y, posSet);
+    y = r.endY;
+    minX = Math.min(minX, r.minX);
+    maxX = Math.max(maxX, r.maxX);
 
-    // After layoutChain places nextNode (and its subtree), find the
-    // continuation arrow from the LAST positioned node in this branch.
-    // layoutChain already advanced y; we just need the next arrow.
     const outArrows = arrows.filter(a => a.srcId === nextNode.id && (!a.srcPort || a.srcPort === 'bottom'));
     arrow = outArrows.length ? outArrows[0] : null;
-    // If node was a decision, layoutChain consumed its sub-tree and returned
-    // past the merge node — the merge node is now `positioned`, so the
-    // next iteration's positioned.has check will stop us cleanly.
+
     if (nextNode.type === 'decision') {
-      const subSi = arrows.find(a => a.srcId === nextNode.id && a.srcPort === 'left');
-      const subNo = arrows.find(a => a.srcId === nextNode.id && a.srcPort === 'right');
-      const subSiBranch = subSi ? walkBranch(subSi) : { mergeId: null };
-      const subNoBranch = subNo ? walkBranch(subNo) : { mergeId: null };
-      const subMergeId = subSiBranch.mergeId || subNoBranch.mergeId;
-      if (subMergeId) {
-        arrow = arrows.find(a => a.srcId === subMergeId && (!a.srcPort || a.srcPort === 'bottom')) || null;
-      } else {
-        break;
-      }
+      const subSi = arrows.find(a => a.srcId === nextNode.id && a.srcPort === 'right');
+      const subNo = arrows.find(a => a.srcId === nextNode.id && a.srcPort === 'left');
+      const subSiB = subSi ? walkBranch(subSi) : { mergeId: null };
+      const subNoB = subNo ? walkBranch(subNo) : { mergeId: null };
+      const subMid = subSiB.mergeId || subNoB.mergeId;
+      if (subMid) {
+        arrow = arrows.find(a => a.srcId === subMid && (!a.srcPort || a.srcPort === 'bottom')) || null;
+      } else { break; }
     }
   }
-  return y;
+  if (minX === Infinity) minX = centerX - MIN_W/2;
+  if (maxX === -Infinity) maxX = centerX + MIN_W/2;
+  return { endY: y, minX, maxX };
 }
 
 function autoLayout() {
+  // Reset layout registries
+  Object.keys(decisionLayout).forEach(k => delete decisionLayout[k]);
+
   const start = nodes.find(n => n.label === 'Inicio') ||
                 nodes.find(n => n.type === 'terminal') ||
                 nodes[0];
@@ -648,16 +721,14 @@ function autoLayout() {
   const positioned = new Set();
   layoutChain(start, COL_X, 80, positioned);
 
-  // Truly orphaned nodes (not reachable from Inicio)
   nodes.filter(n => !positioned.has(n.id)).forEach((node, i) => {
-    node.x = COL_X + 380;
+    node.x = COL_X + 600;
     node.y = 80 + i * (node.h + V_GAP);
     updateNodePos(node);
   });
 
   redrawAllArrows();
 }
-
 // ═══════════════════════════════════════════════════════
 //  INSERT AFTER NODE
 //  For 'decision': inserts decision + SI branch (left) + NO branch (right)
@@ -717,11 +788,16 @@ function insertDecision(afterNodeId) {
   // afterNode → decision (main flow down)
   mkArrow(afterNodeId, dec.id, '', null, null);
 
-  // decision → oldDst directly via SI (left) and NO (right) lines — no process boxes yet.
-  // Later: select a shape and click on one of these lines to insert it there.
+  // decision → oldDst directly via NO (left) and SI (right) lines — no process boxes yet.
+  // Layout engine: left = NO (izquierda), right = SI (derecha).
   if (oldDstId) {
     mkArrow(dec.id, oldDstId, 'NO', 'left',  'top');
     mkArrow(dec.id, oldDstId, 'SI', 'right', 'top');
+  } else {
+    // No successor yet — create a stub Fin node so both branches have somewhere to go.
+    const stub = mkNode('terminal', 0, 0, 'Fin');
+    mkArrow(dec.id, stub.id, 'NO', 'left',  'top');
+    mkArrow(dec.id, stub.id, 'SI', 'right', 'top');
   }
 
   autoLayout();
@@ -748,8 +824,8 @@ function insertOnArrow(arrowId) {
     removeArrowEl(arrow.id);
     arrows = arrows.filter(a => a.id !== arrow.id);
     mkArrow(srcId, dec.id, label, srcPort, 'top');
-    mkArrow(dec.id, dstId, 'NO', 'left',  'top');
-    mkArrow(dec.id, dstId, 'SI', 'right', 'top');
+    mkArrow(dec.id, dstId, 'NO', 'left',  'top');  // left = NO
+    mkArrow(dec.id, dstId, 'SI', 'right', 'top');  // right = SI
     autoLayout();
     deselectTool();
     selectNode(dec.id);
@@ -1159,6 +1235,7 @@ document.getElementById('modal-overlay').addEventListener('click', e => {
 // ═══════════════════════════════════════════════════════
 function saveDiagram() {
   if (!nodes.length) { setStatus('No hay nada que guardar.'); return; }
+  resetConvergeCache();
   let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
   nodes.forEach(n => {
     minX=Math.min(minX,n.x); minY=Math.min(minY,n.y);
@@ -1167,103 +1244,65 @@ function saveDiagram() {
   const pad=60, W=maxX-minX+pad*2, H=maxY-minY+pad*2, ox=minX-pad, oy=minY-pad;
   let svg = `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="${ox} ${oy} ${W} ${H}">
-<defs><marker id="ah" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-  <polygon points="0 0,10 3.5,0 7" fill="#3a7bd5"/></marker></defs>
+<defs><marker id="ah" markerWidth="8" markerHeight="5.6" refX="7.2" refY="2.8" orient="auto">
+  <polygon points="0 0,8 2.8,0 5.6" fill="#3a7bd5"/></marker></defs>
 <rect x="${ox}" y="${oy}" width="${W}" height="${H}" fill="#f5f8ff"/>
 `;
   arrows.forEach(arrow => {
     const src=nodes.find(n=>n.id===arrow.srcId), dst=nodes.find(n=>n.id===arrow.dstId);
     if (!src||!dst) return;
-    const sd = arrow.srcPort || bestDirs(src,dst)[0];
-    const dd = arrow.dstPort || bestDirs(src,dst)[1];
-    const sp=getPort(src,sd), dp=getPort(dst,dd);
 
-    let isDecisionBranch = false, isMergedBranch = false;
-    if ((sd==='left'||sd==='right') && src.type==='decision') {
-      isDecisionBranch = true;
-      const siblingPort = sd==='left' ? 'right' : 'left';
-      if (arrows.find(a => a.srcId===src.id && a.dstId===dst.id && a.srcPort===siblingPort)) isMergedBranch = true;
+    const sxCx = src.x + src.w / 2, sxBy = src.y + src.h;
+    const dxCx = dst.x + dst.w / 2, dxTy = dst.y;
+
+    // Detect convergence
+    const allToTop2 = arrows.filter(a => a.dstId === dst.id && a.dstPort === 'top');
+    const branches2 = allToTop2.filter(a => !!getBranchInfo(a));
+    const isConv2   = branches2.length >= 2 && branches2.some(a => a.id === arrow.id);
+
+    let mergeBarY2 = dst.y - 22;
+    if (isConv2) {
+      let maxSB = 0;
+      branches2.forEach(a => { const s=nodes.find(n=>n.id===a.srcId); if(s) maxSB=Math.max(maxSB,s.y+s.h); });
+      mergeBarY2 = Math.min(maxSB + Math.round(V_GAP*0.4), dst.y - 22);
     }
 
-    let mergeRole = null, mergePartner = null;
-    if (!isMergedBranch && dd === 'top') {
-      const side = findBranchSideForArrow(arrow);
-      if (side) {
-        mergePartner = arrows.find(a => a.id !== arrow.id && a.dstId === arrow.dstId && a.dstPort === 'top' &&
-          findBranchSideForArrow(a) === (side === 'left' ? 'right' : 'left'));
-        if (mergePartner) mergeRole = side === 'left' ? 'stop' : 'through';
-      }
+    let throughId2 = branches2[0]?.id;
+    if (isConv2) {
+      let best2 = -Infinity;
+      branches2.forEach(a => {
+        const info2=getBranchInfo(a), s2=nodes.find(n=>n.id===a.srcId);
+        const sc2=(info2&&info2.side==='si'?10000:0)+(s2?s2.x+s2.w/2:0);
+        if(sc2>best2){best2=sc2;throughId2=a.id;}
+      });
     }
-    const mergeX = dp.x;
-    let mergeBendY = dst.y - 18;
-    if (mergeRole && mergePartner) {
-      const partnerSrc = nodes.find(n => n.id === mergePartner.srcId);
-      if (partnerSrc) mergeBendY = Math.max(src.y + src.h, partnerSrc.y + partnerSrc.h) + V_GAP / 2;
-    }
-    mergeBendY = Math.min(mergeBendY, dp.y - 12);
+    const iAmThrough2 = !isConv2 || arrow.id === throughId2;
 
-    let pathD, lx, ly, drawHead = true;
-    if (isMergedBranch) {
-      const cy = src.y + src.h/2, cx = src.x + src.w/2;
-      const mY = Math.min(src.y + src.h + V_GAP/2, dp.y - 12);
-      const sideX = sd==='left' ? src.x - SIDE_STUB : src.x + src.w + SIDE_STUB;
-      if (sd==='left') {
-        pathD = `M${sp.x},${sp.y} L${sideX},${cy} L${sideX},${mY} L${cx},${mY}`;
-        drawHead = false;
-      } else {
-        const pts = [
-          [sp.x, sp.y], [sideX, cy], [sideX, mY],
-          [cx, mY], [cx, dp.y], [dp.x, dp.y]
-        ].filter((p, i, arr) => i === 0 || p[0] !== arr[i-1][0] || p[1] !== arr[i-1][1]);
-        pathD = 'M' + pts.map(p => p.join(',')).join(' L');
-        drawHead = true;
-      }
-      lx = (sp.x+sideX)/2; ly = cy-10;
-    } else if (isDecisionBranch) {
-      const cy = src.y + src.h/2;
-      const sideX = sd==='left' ? src.x - SIDE_STUB : src.x + src.w + SIDE_STUB;
-      let pts;
-      if (mergeRole) {
-        pts = [[sp.x, sp.y], [sideX, cy], [sideX, mergeBendY], [mergeX, mergeBendY]];
-        if (mergeRole === 'through') pts.push([dp.x, dp.y]);
-        drawHead = mergeRole === 'through';
-      } else {
-        const useStub = sd==='left' ? dp.x <= sideX : dp.x >= sideX;
-        const turnX = useStub ? sideX : sp.x;
-        pts = [[sp.x, sp.y], [turnX, cy], [dp.x, cy], [dp.x, dp.y]];
-      }
-      pathD = 'M' + pts.filter((p, i, arr) => i === 0 || p[0] !== arr[i-1][0] || p[1] !== arr[i-1][1]).map(p => p.join(',')).join(' L');
-      lx = sideX + (sd==='left' ? -14 : 14); ly = cy-10;
-    } else if (sd==='left'||sd==='right') {
-      let pts;
-      if (mergeRole) {
-        pts = [[sp.x, sp.y], [mergeX, sp.y], [mergeX, mergeBendY]];
-        if (mergeRole === 'through') pts.push([dp.x, dp.y]);
-        drawHead = mergeRole === 'through';
-      } else {
-        pts = [[sp.x, sp.y], [dp.x, sp.y], [dp.x, dp.y]];
-      }
-      pathD = 'M' + pts.filter((p, i, arr) => i === 0 || p[0] !== arr[i-1][0] || p[1] !== arr[i-1][1]).map(p => p.join(',')).join(' L');
-      lx=(sp.x+dp.x)/2; ly=sp.y-10;
-    } else if (sp.x === dp.x && !mergeRole) {
-      pathD = `M${sp.x},${sp.y} L${dp.x},${dp.y}`;
-      lx=(sp.x+dp.x)/2; ly=(sp.y+dp.y)/2-8;
+    let pathD2, lx2, ly2, drawHead2=true;
+
+    if (isConv2) {
+      const pts=[[sxCx,sxBy],[sxCx,mergeBarY2],[dxCx,mergeBarY2]];
+      if(iAmThrough2) pts.push([dxCx,dxTy]);
+      drawHead2=iAmThrough2;
+      const npts=pts.filter((p,i,a)=>i===0||p[0]!==a[i-1][0]||p[1]!==a[i-1][1]);
+      pathD2='M'+npts.map(p=>p[0]+','+p[1]).join(' L');
+      lx2=(sxCx+dxCx)/2; ly2=mergeBarY2-13;
+    } else if (Math.abs(sxCx-dxCx)<3) {
+      pathD2=`M${sxCx},${sxBy} L${dxCx},${dxTy}`;
+      lx2=sxCx; ly2=(sxBy+dxTy)/2-8;
     } else {
-      let pts;
-      if (mergeRole) {
-        pts = [[sp.x, sp.y], [sp.x, mergeBendY], [mergeX, mergeBendY]];
-        if (mergeRole === 'through') pts.push([dp.x, dp.y]);
-        drawHead = mergeRole === 'through';
-      } else {
-        const my=(sp.y+dp.y)/2;
-        pts = [[sp.x, sp.y], [sp.x, my], [dp.x, my], [dp.x, dp.y]];
-      }
-      pathD = 'M' + pts.filter((p, i, arr) => i === 0 || p[0] !== arr[i-1][0] || p[1] !== arr[i-1][1]).map(p => p.join(',')).join(' L');
-      lx=(sp.x+dp.x)/2; ly=(sp.y+dp.y)/2-8;
+      const midY2=Math.round((sxBy+dxTy)/2);
+      const pts=[[sxCx,sxBy],[sxCx,midY2],[dxCx,midY2],[dxCx,dxTy]];
+      const npts=pts.filter((p,i,a)=>i===0||p[0]!==a[i-1][0]||p[1]!==a[i-1][1]);
+      pathD2='M'+npts.map(p=>p[0]+','+p[1]).join(' L');
+      lx2=(sxCx+dxCx)/2; ly2=midY2-10;
     }
-    svg+=`<path d="${pathD}" stroke="#3a7bd5" stroke-width="2.5" fill="none" ${drawHead ? 'marker-end="url(#ah)"' : ''}/>\n`;
+
+    svg+=`<path d="${pathD2}" stroke="#3a7bd5" stroke-width="2.5" fill="none" ${drawHead2?'marker-end="url(#ah)"':''}/>
+`;
     if (arrow.label) {
-      svg+=`<text x="${lx}" y="${ly}" text-anchor="middle" font-family="Arial" font-size="11" font-weight="700" fill="#3a7bd5">${xmlEsc(arrow.label)}</text>\n`;
+      svg+=`<text x="${lx2}" y="${ly2}" text-anchor="middle" font-family="Arial" font-size="11" font-weight="700" fill="#3a7bd5">${xmlEsc(arrow.label)}</text>
+`;
     }
   });
   nodes.forEach(node => {
@@ -1287,6 +1326,15 @@ function saveDiagram() {
       ty+=lineH;
     });
   });
+  // ── Watermark ITES-DFD ───────────────────────────────
+  // Positioned at top-left of the exported image, subtle but legible.
+  const wmX = ox + 14;
+  const wmY = oy + 22;
+  svg += `<text x="${wmX}" y="${wmY}"
+    font-family="'Segoe UI',Arial,sans-serif" font-size="13" font-weight="800"
+    fill="#3a7bd5" opacity="0.38" letter-spacing="2"
+    style="user-select:none">ITES-DFD</text>\n`;
+
   svg+='</svg>';
   const blob=new Blob([svg],{type:'image/svg+xml'});
   const url=URL.createObjectURL(blob);
