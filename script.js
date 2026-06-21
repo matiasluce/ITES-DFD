@@ -40,6 +40,14 @@ let dragOX = 0, dragOY = 0;
 const _mCanvas = document.createElement('canvas');
 const _mCtx    = _mCanvas.getContext('2d');
 
+// Cached DOM references
+const _canvasEl   = document.getElementById('canvas');
+const _arrowsSvg  = document.getElementById('arrows');
+const _ghostEl    = document.getElementById('ghost');
+const _statusBar  = document.getElementById('status-bar');
+const _modalOvr   = document.getElementById('modal-overlay');
+const _canvasWrap = document.getElementById('canvas-wrap');
+
 // ═══════════════════════════════════════════════════════
 //  TEXT MEASUREMENT
 // ═══════════════════════════════════════════════════════
@@ -131,7 +139,7 @@ function mountNode(node) {
     el = document.createElement('div');
     el.className = 'node';
     el.id = node.id;
-    document.getElementById('canvas').appendChild(el);
+    _canvasEl.appendChild(el);
     el.addEventListener('mousedown', onNodeMouseDown);
     el.addEventListener('click',    onNodeClick);
     el.addEventListener('dblclick', onNodeDblClick);
@@ -159,19 +167,6 @@ function getPortTB(node, dir) {
   return { x: cx, y: node.y + node.h }; // bottom (default)
 }
 
-// Keep getPort for legacy calls in saveDiagram
-function getPort(node, dir) {
-  const cx = node.x + node.w / 2, cy = node.y + node.h / 2;
-  if (dir === 'top')    return { x: cx, y: node.y };
-  if (dir === 'bottom') return { x: cx, y: node.y + node.h };
-  if (dir === 'left')   return { x: node.x, y: cy };
-  if (dir === 'right')  return { x: node.x + node.w, y: cy };
-}
-
-function bestDirs(src, dst) {
-  return ['bottom','top'];
-}
-
 function ptsToPath(pts) {
   return 'M' + pts.map(p => p[0] + ',' + p[1]).join(' L');
 }
@@ -192,30 +187,20 @@ function getBranchInfo(arrow) {
         return { decId: s.id, side: cur.srcPort === 'left' ? 'no' : 'si' };
       }
     }
-    const inc = arrows.filter(a => a.dstId === cur.srcId);
-    if (inc.length !== 1) return null;
-    cur = inc[0];
+    const srcNode = nodes.find(n => n.id === cur.srcId);
+    if (!srcNode || srcNode.incoming.length !== 1) return null;
+    cur = arrows.find(a => a.id === srcNode.incoming[0]);
   }
   return null;
 }
 
-// Legacy compatibility shim used by saveDiagram
-function findBranchSideForArrow(arrow) {
-  const info = getBranchInfo(arrow);
-  if (!info) return null;
-  return info.side === 'no' ? 'left' : 'right';
-}
-
-function resetConvergeCache() {} // no longer needed, kept for compat
-
 function mountArrow(arrow) {
-  const svgEl = document.getElementById('arrows');
   let g = document.getElementById(arrow.id);
   if (!g) {
     g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
     g.id = arrow.id;
     g.style.pointerEvents = 'auto';
-    svgEl.appendChild(g);
+    _arrowsSvg.appendChild(g);
   }
   g.replaceChildren();
 
@@ -253,9 +238,9 @@ function mountArrow(arrow) {
         const s = nodes.find(n => n.id === cur.srcId);
         if (s && s.type === 'decision') return s.id; // stop at FIRST decision found
       }
-      const incs = arrows.filter(x => x.dstId === cur.srcId);
-      if (incs.length !== 1) break;
-      cur = incs[0];
+      const srcNode = nodes.find(n => n.id === cur.srcId);
+      if (!srcNode || srcNode.incoming.length !== 1) break;
+      cur = arrows.find(a => a.id === srcNode.incoming[0]);
     }
     return null;
   }
@@ -263,6 +248,7 @@ function mountArrow(arrow) {
   const myRootDecId = getImmediateDecId(arrow);
 
   // All arrows arriving at dst that belong to the same immediate decision
+  // (used only to pick THIS arrow's exit column from its own decision — unrelated to convergence detection below).
   const allSameRoot = myRootDecId
     ? arrows.filter(a => a.dstId === dst.id && getImmediateDecId(a) === myRootDecId)
     : [];
@@ -273,32 +259,42 @@ function mountArrow(arrow) {
     return (a.srcPort === 'left' || a.srcPort === 'right') && s && s.id === myRootDecId;
   });
 
-  const isConverging = directBranches.length >= 2 && allSameRoot.some(a => a.id === arrow.id);
+  // ── Convergence detection ─────────────────────────────────
+  // ANY destination with 2+ incoming arrows is a convergence point — this
+  // also covers nested decisions, where one branch reaches dst directly while
+  // the other reaches it only after passing through a second, inner decision
+  // (whose own SI/NO already merged earlier). All such arrows must share the
+  // SAME merge bar height so they visibly join into a single line instead of
+  // bending at different heights.
+  const allIncoming = arrows.filter(a => a.dstId === dst.id);
+  const isConverging = allIncoming.length >= 2;
 
   // ── Compute mergeBarY ────────────────────────────────────
-  // Read from decisionLayout (computed by autoLayout, always correct).
-  // NOT clamped to dst position — dst can be dragged freely below the bar.
+  // Take the deepest (max) mergeBarY among every incoming arrow's OWN root
+  // decision — autoLayout already guarantees a parent decision's bar sits at
+  // or below any nested child decision's bar, so the max across all roots
+  // converging here is the one shared height all of them should bend at.
   let mergeBarY = dstTop - V_GAP; // safe fallback for non-converging arrows
 
-  if (isConverging && myRootDecId) {
-    const rdl = decisionLayout[myRootDecId];
-    if (rdl && rdl.mergeBarY != null) {
-      mergeBarY = rdl.mergeBarY;
-    } else {
-      // decisionLayout not yet populated (first render before autoLayout)
-      // Fall back to a position above dst
-      mergeBarY = dstTop - Math.round(V_GAP * 1.5);
-    }
+  if (isConverging) {
+    let best = -Infinity;
+    allIncoming.forEach(a => {
+      const rootId = getImmediateDecId(a);
+      const rdl = rootId ? decisionLayout[rootId] : null;
+      if (rdl && rdl.mergeBarY != null) best = Math.max(best, rdl.mergeBarY);
+    });
+    mergeBarY = best > -Infinity ? best : dstTop - Math.round(V_GAP * 1.5);
   }
 
   // ── iAmThrough: only one arrow draws the final arrowhead into dst ─────────
-  // Pick the SI-side (right) direct branch arrow as the "through" arrow.
+  // Prefer the SI-side (right) branch among ALL converging incoming arrows;
+  // among ties pick rightmost source x. This is decided across every arrow
+  // reaching dst, not just the ones sharing this arrow's immediate decision.
   let iAmThrough = !isConverging; // single arrows always draw head
   if (isConverging) {
-    // Prefer the SI direct branch; among ties pick rightmost source x
-    let throughId = directBranches[0]?.id ?? arrow.id;
+    let throughId = allIncoming[0].id;
     let best = -Infinity;
-    allSameRoot.forEach(a => {
+    allIncoming.forEach(a => {
       const info = getBranchInfo(a);
       const s = nodes.find(n => n.id === a.srcId);
       const score = (info && info.side === 'si' ? 10000 : 0) + (s ? s.x + s.w / 2 : 0);
@@ -328,8 +324,11 @@ function mountArrow(arrow) {
         [colX,    mergeBarY],
         [dstCx,   mergeBarY],
       ]);
-      if (iAmThrough) pts.push([dstCx, dstTop]);
-      drawHead = iAmThrough;
+      // The arrowhead and the final drop into dst are drawn separately as the
+      // "trunk" below — it's shared by every converging branch and sits
+      // outside any single decision's path, so it must never be colored or
+      // highlighted as if it belonged to this one branch.
+      drawHead = false;
       pathD = ptsToPath(pts);
     } else {
       // No convergence: goes straight to dst via a stair-step
@@ -347,14 +346,14 @@ function mountArrow(arrow) {
 
   } else if (isConverging) {
     // Node inside a branch converges to dst (e.g. "Proceso → Fin")
-    // Goes straight down from its bottom to mergeBarY, then across to dstCx
+    // Goes straight down from its bottom to mergeBarY, then across to dstCx.
+    // Arrowhead/final drop is handled by the shared "trunk" below.
     const pts = dedup([
       [srcCx, srcBot],
       [srcCx, mergeBarY],
       [dstCx, mergeBarY],
     ]);
-    if (iAmThrough) pts.push([dstCx, dstTop]);
-    drawHead = iAmThrough;
+    drawHead = false;
     pathD = ptsToPath(pts);
     labelX = srcCx;
     labelY = (srcBot + mergeBarY) / 2 - 8;
@@ -418,8 +417,8 @@ function mountArrow(arrow) {
 
   // ── Merge bar hit area (only on the through arrow) ───────
   if (isConverging && iAmThrough) {
-    // Compute the X span of the merge bar from all converging sources
-    const xs = allSameRoot.map(a => {
+    // Compute the X span of the merge bar from ALL converging incoming arrows
+    const xs = allIncoming.map(a => {
       const s = nodes.find(n => n.id === a.srcId);
       const info = getBranchInfo(a);
       if (info && s && s.type === 'decision') {
@@ -435,13 +434,40 @@ function mountArrow(arrow) {
     barHit.setAttribute('stroke-width', '18');
     barHit.setAttribute('fill', 'none');
     barHit.style.cursor = 'pointer';
-    const otherArrowId = allSameRoot.find(a => a.id !== arrow.id)?.id || arrow.id;
+    const allIncomingIds = allIncoming.map(a => a.id);
     barHit.addEventListener('click', e => {
       e.stopPropagation();
-      if (selectedTool) { insertAfterMerge(otherArrowId, arrow.id, dst.id); return; }
-      selectArrow(arrow.id);
+      if (selectedTool) { insertAfterMerge(allIncomingIds, dst.id); return; }
+      clearArrowSel();
     });
     g.appendChild(barHit);
+
+    // ── Shared trunk: the final drop from the merge bar into dst ─────────
+    // This single segment is fed by EVERY converging branch (not just the
+    // "through" one carrying this arrow's id), so it must read as its own
+    // thing — always default blue with the default arrowhead, never tinted
+    // or selected as part of whichever branch happens to render it.
+    const trunkD = `M${dstCx},${mergeBarY} L${dstCx},${dstTop}`;
+    const trunkPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    trunkPath.setAttribute('d', trunkD);
+    trunkPath.setAttribute('stroke', '#5b9cf6');
+    trunkPath.setAttribute('stroke-width', '2.5');
+    trunkPath.setAttribute('fill', 'none');
+    trunkPath.setAttribute('marker-end', 'url(#ah)');
+    g.appendChild(trunkPath);
+
+    const trunkHit = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    trunkHit.setAttribute('d', trunkD);
+    trunkHit.setAttribute('stroke', 'transparent');
+    trunkHit.setAttribute('stroke-width', '14');
+    trunkHit.setAttribute('fill', 'none');
+    trunkHit.style.cursor = 'pointer';
+    trunkHit.addEventListener('click', e => {
+      e.stopPropagation();
+      if (selectedTool) { insertAfterMerge(allIncomingIds, dst.id); return; }
+      clearArrowSel();
+    });
+    g.appendChild(trunkHit);
   }
 }
 
@@ -453,7 +479,7 @@ function redrawAllArrows() { arrows.forEach(mountArrow); }
 // ═══════════════════════════════════════════════════════
 function mkNode(type, x, y, label) {
   const id   = 'n' + (nodeSeq++);
-  const node = { id, type, label, x, y, w: MIN_W, h: MIN_H_NORM };
+  const node = { id, type, label, x, y, w: MIN_W, h: MIN_H_NORM, incoming: [], outgoing: [] };
   nodes.push(node);
   mountNode(node);
   return node;
@@ -463,9 +489,23 @@ function mkArrow(srcId, dstId, label, srcPort, dstPort) {
   const id    = 'a' + (arrowSeq++);
   const arrow = { id, srcId, dstId, label: label || '', srcPort: srcPort||null, dstPort: dstPort||null };
   arrows.push(arrow);
-  resetConvergeCache();
+  const srcNode = nodes.find(n => n.id === srcId);
+  const dstNode = nodes.find(n => n.id === dstId);
+  if (srcNode) srcNode.outgoing.push(id);
+  if (dstNode) dstNode.incoming.push(id);
   mountArrow(arrow);
   return arrow;
+}
+
+function removeArrow(arrowId) {
+  const arrow = arrows.find(a => a.id === arrowId);
+  if (!arrow) return;
+  removeArrowEl(arrowId);
+  arrows = arrows.filter(a => a.id !== arrowId);
+  const srcNode = nodes.find(n => n.id === arrow.srcId);
+  const dstNode = nodes.find(n => n.id === arrow.dstId);
+  if (srcNode) srcNode.outgoing = srcNode.outgoing.filter(id => id !== arrowId);
+  if (dstNode) dstNode.incoming = dstNode.incoming.filter(id => id !== arrowId);
 }
 
 // ═══════════════════════════════════════════════════════
@@ -484,8 +524,8 @@ function getMainChain() {
   while (cur && !visited.has(cur.id)) {
     visited.add(cur.id); chain.push(cur);
     if (cur.type === 'decision') {
-      const siArrow = arrows.find(a => a.srcId === cur.id && a.srcPort === 'left');
-      const noArrow = arrows.find(a => a.srcId === cur.id && a.srcPort === 'right');
+      const noArrow = arrows.find(a => a.srcId === cur.id && a.srcPort === 'left');
+      const siArrow = arrows.find(a => a.srcId === cur.id && a.srcPort === 'right');
       const siBranch = siArrow ? walkBranch(siArrow) : { nodes: [], mergeId: null };
       const noBranch = noArrow ? walkBranch(noArrow) : { nodes: [], mergeId: null };
       siBranch.nodes.forEach(n => { if (!visited.has(n.id)) { visited.add(n.id); chain.push(n); } });
@@ -514,9 +554,7 @@ function walkBranch(startArrow) {
     seen.add(arrow.id);
     const nextNode = nodes.find(n => n.id === arrow.dstId);
     if (!nextNode) break;
-    const incoming = arrows.filter(a => a.dstId === nextNode.id);
-    if (incoming.length > 1) {
-      // Convergence point — belongs to the trunk, not this branch
+    if (nextNode.incoming.length > 1) {
       return { nodes: chainNodes, mergeId: nextNode.id };
     }
     chainNodes.push(nextNode);
@@ -535,7 +573,13 @@ function walkBranch(startArrow) {
       subNo.nodes.forEach(n => chainNodes.push(n));
       const subMergeId = subSi.mergeId || subNo.mergeId;
       if (subMergeId) {
-        // Continue walking from the sub-merge node
+        // If the merge node has more incoming arrows than the nested decision's
+        // sub-branches, it's ALSO the outer convergence point — stop here.
+        const mergeNode = nodes.find(n => n.id === subMergeId);
+        const subCount = (subSiArrow ? 1 : 0) + (subNoArrow ? 1 : 0);
+        if (mergeNode && mergeNode.incoming.length > subCount) {
+          return { nodes: chainNodes, mergeId: subMergeId };
+        }
         arrow = arrows.find(a => a.srcId === subMergeId && (!a.srcPort || a.srcPort === 'bottom')) || null;
         if (arrow) continue;
       }
@@ -630,7 +674,7 @@ function layoutChain(cur, centerX, startY, positioned) {
 
       // Parent merge bar: at least V_GAP*0.6 below branch content,
       // but also at or below the deepest child merge bar so outer lines clear inner ones.
-      const naturalBar = bottomY + Math.round(V_GAP * 0.6);
+      const naturalBar = bottomY + Math.round(V_GAP * 0.3);
       const mergeBarYForDec = Math.max(naturalBar, deepestChildBar);
 
       // Store for arrow router
@@ -646,18 +690,34 @@ function layoutChain(cur, centerX, startY, positioned) {
       minX = Math.min(minX, noReal.minX);
       maxX = Math.max(maxX, siReal.maxX);
       // Position merge node well below the bar so there's room to insert nodes
-      y = mergeBarYForDec + Math.round(V_GAP * 1.5);
+      y = mergeBarYForDec + Math.round(V_GAP * 1.0);
 
       const mergeId = noBranch.mergeId || siBranch.mergeId;
-      if (mergeId && !positioned.has(mergeId)) {
-        cur = nodes.find(n => n.id === mergeId);
+      const mergeNode = mergeId ? nodes.find(n => n.id === mergeId) : null;
+      if (mergeNode && positioned.has(mergeNode.id)) {
+        // The merge node was already positioned while laying out a NESTED
+        // decision's own (shallower) branch — that inner decision doesn't
+        // know about THIS outer decision's wider/deeper bar. Push it down so
+        // it always lands below every decision that converges on it, instead
+        // of leaving it too high (which made the merge bar/line geometry
+        // overlap and zigzag). Always correct x to the current centerX even
+        // if y is already deep enough — the branch centerX differs from the
+        // main chain centerX.
+        mergeNode.x = Math.round(centerX - mergeNode.w / 2);
+        if (mergeNode.y < y) mergeNode.y = Math.round(y);
+        updateNodePos(mergeNode);
+      }
+      if (mergeNode && !positioned.has(mergeNode.id)) {
+        cur = mergeNode;
       } else { break; }
 
     } else {
       y += cur.h + V_GAP;
       const outArrows = arrows.filter(a => a.srcId === cur.id);
       const nextArrow = outArrows.find(a => !a.srcPort || a.srcPort === 'bottom') || outArrows[0];
-      cur = nextArrow ? nodes.find(n => n.id === nextArrow.dstId) : null;
+      const nextCandidate = nextArrow ? nodes.find(n => n.id === nextArrow.dstId) : null;
+      if (nextCandidate && nextCandidate.incoming.length > 1) return { endY: y, minX, maxX };
+      cur = nextCandidate;
     }
   }
   if (minX === Infinity) minX = centerX - MIN_W / 2;
@@ -681,8 +741,7 @@ function layoutBranchNodes(branchStartArrow, centerX, startY, positioned, dryRun
 
     const nextNode = nodes.find(n => n.id === arrow.dstId);
     if (!nextNode) break;
-    const incoming = arrows.filter(a => a.dstId === nextNode.id);
-    if (incoming.length > 1) break; // convergence node — stop
+    if (nextNode.incoming.length > 1) break;
     if (posSet.has(nextNode.id)) break;
 
     const r = layoutChain(nextNode, centerX, y, posSet);
@@ -700,6 +759,9 @@ function layoutBranchNodes(branchStartArrow, centerX, startY, positioned, dryRun
       const subNoB = subNo ? walkBranch(subNo) : { mergeId: null };
       const subMid = subSiB.mergeId || subNoB.mergeId;
       if (subMid) {
+        const mergeNode = nodes.find(n => n.id === subMid);
+        const subCnt = (subSi ? 1 : 0) + (subNo ? 1 : 0);
+        if (mergeNode && mergeNode.incoming.length > subCnt) break;
         arrow = arrows.find(a => a.srcId === subMid && (!a.srcPort || a.srcPort === 'bottom')) || null;
       } else { break; }
     }
@@ -749,14 +811,37 @@ function insertAfterNode(afterNodeId) {
     return;
   }
 
+  // Clicking on a decision with a non-decision tool: insert on the trunk
+  // after the merge (convergence) point instead of creating a bottom arrow
+  // that would bypass the SI/NO branches.
+  if (afterNode.type === 'decision') {
+    const noA = arrows.find(a => a.srcId === afterNode.id && a.srcPort === 'left');
+    const siA = arrows.find(a => a.srcId === afterNode.id && a.srcPort === 'right');
+    const branchArrows = [noA, siA].filter(Boolean);
+    if (branchArrows.length >= 1) {
+      let mergeId = null;
+      for (const ba of branchArrows) {
+        const w = walkBranch(ba);
+        if (w.mergeId) { mergeId = w.mergeId; break; }
+      }
+      if (mergeId) {
+        const allIncoming = arrows.filter(a => a.dstId === mergeId);
+        insertAfterMerge(allIncoming.map(a => a.id), mergeId);
+        return;
+      }
+    }
+    setStatus('Haz clic sobre una línea SI/NO o en la barra de unión para insertar.');
+    deselectTool();
+    return;
+  }
+
   // Normal insert
   const existingArrow = arrows.find(a => a.srcId === afterNodeId && (!a.srcPort || a.srcPort === 'bottom'));
   const newNode = mkNode(selectedTool, afterNode.x, afterNode.y + afterNode.h + V_GAP, DEFAULT_LABELS[selectedTool]);
 
   if (existingArrow) {
     const oldDstId = existingArrow.dstId;
-    removeArrowEl(existingArrow.id);
-    arrows = arrows.filter(a => a.id !== existingArrow.id);
+    removeArrow(existingArrow.id);
     mkArrow(afterNodeId, newNode.id, '', null, null);
     mkArrow(newNode.id, oldDstId, '', null, null);
   } else {
@@ -781,8 +866,7 @@ function insertDecision(afterNodeId) {
 
   // Remove old arrow from afterNode
   if (existingArrow) {
-    removeArrowEl(existingArrow.id);
-    arrows = arrows.filter(a => a.id !== existingArrow.id);
+    removeArrow(existingArrow.id);
   }
 
   // afterNode → decision (main flow down)
@@ -821,8 +905,7 @@ function insertOnArrow(arrowId) {
   if (selectedTool === 'decision') {
     // Insert a decision in the middle of the line, branching SI/NO back into the same target
     const dec = mkNode('decision', 0, 0, 'Condición');
-    removeArrowEl(arrow.id);
-    arrows = arrows.filter(a => a.id !== arrow.id);
+    removeArrow(arrow.id);
     mkArrow(srcId, dec.id, label, srcPort, 'top');
     mkArrow(dec.id, dstId, 'NO', 'left',  'top');  // left = NO
     mkArrow(dec.id, dstId, 'SI', 'right', 'top');  // right = SI
@@ -835,8 +918,7 @@ function insertOnArrow(arrowId) {
 
   const newNode = mkNode(selectedTool, 0, 0, DEFAULT_LABELS[selectedTool]);
 
-  removeArrowEl(arrow.id);
-  arrows = arrows.filter(a => a.id !== arrow.id);
+  removeArrow(arrow.id);
 
   // Primer tramo: hereda el puerto/label original (ej. "SI"/"NO" de la decisión padre).
   // Segundo tramo: srcPort null para que findBranchSideForArrow pueda remontar
@@ -858,11 +940,10 @@ function insertOnArrow(arrowId) {
 //  branch arrows are re-pointed to the new node, and a fresh arrow
 //  continues from the new node down to the original convergence target.
 // ═══════════════════════════════════════════════════════
-function insertAfterMerge(noArrowId, siArrowId, oldDstId) {
+function insertAfterMerge(arrowIds, oldDstId) {
   if (!selectedTool) return;
-  const noArrow = arrows.find(a => a.id === noArrowId);
-  const siArrow = arrows.find(a => a.id === siArrowId);
-  if (!noArrow || !siArrow) return;
+  const incoming = arrowIds.map(id => arrows.find(a => a.id === id)).filter(Boolean);
+  if (incoming.length < 2) return;
 
   if (selectedTool === 'decision') {
     setStatus('No se puede insertar una decisión justo en la barra de unión.');
@@ -871,9 +952,10 @@ function insertAfterMerge(noArrowId, siArrowId, oldDstId) {
 
   const newNode = mkNode(selectedTool, 0, 0, DEFAULT_LABELS[selectedTool]);
 
-  // Re-point both converging branches to land on the new node instead of the old target.
-  noArrow.dstId = newNode.id;
-  siArrow.dstId = newNode.id;
+  // Remove old converging arrows and create new ones pointing to the new node
+  const replays = incoming.map(a => ({ srcId: a.srcId, label: a.label, srcPort: a.srcPort, dstPort: a.dstPort }));
+  incoming.forEach(a => removeArrow(a.id));
+  replays.forEach(r => mkArrow(r.srcId, newNode.id, r.label, r.srcPort, r.dstPort));
 
   // Continue the trunk from the new node down to whatever followed the merge before.
   mkArrow(newNode.id, oldDstId, '', null, null);
@@ -892,12 +974,11 @@ function selectTool(type) {
   deselectTool();
   selectedTool = type;
   document.getElementById('tool-' + type).classList.add('active');
-  const ghost = document.getElementById('ghost');
   const lbl = DEFAULT_LABELS[type];
   const { w, h } = calcNodeSize(type, lbl);
-  ghost.style.width  = w + 'px';
-  ghost.style.height = h + 'px';
-  ghost.innerHTML = buildSVG(type, lbl, w, h);
+  _ghostEl.style.width  = w + 'px';
+  _ghostEl.style.height = h + 'px';
+  _ghostEl.innerHTML = buildSVG(type, lbl, w, h);
   nodes.forEach(n => { const el = document.getElementById(n.id); if (el) el.classList.add('ins-target'); });
   clearNodeSel(); clearArrowSel();
   const names = {terminal:'Terminal',input:'Entrada',process:'Proceso',decision:'Decisión',print:'Imprimir'};
@@ -910,8 +991,7 @@ function deselectTool() {
     if (btn) btn.classList.remove('active');
   }
   selectedTool = null;
-  const ghost = document.getElementById('ghost');
-  ghost.style.display = 'none';
+  _ghostEl.style.display = 'none';
   nodes.forEach(n => { const el = document.getElementById(n.id); if (el) el.classList.remove('ins-target'); });
 }
 
@@ -936,7 +1016,7 @@ function onNodeMouseDown(e) {
   dragActive = false;
   dragNodeId = e.currentTarget.id;
   const node = nodes.find(n => n.id === dragNodeId);
-  const rect = document.getElementById('canvas').getBoundingClientRect();
+  const rect = _canvasEl.getBoundingClientRect();
   dragOX = (e.clientX - rect.left) / zoomLevel - node.x;
   dragOY = (e.clientY - rect.top)  / zoomLevel - node.y;
   e.preventDefault();
@@ -947,7 +1027,7 @@ document.addEventListener('mousemove', e => {
   dragActive = true;
   const node = nodes.find(n => n.id === dragNodeId);
   if (!node) return;
-  const rect = document.getElementById('canvas').getBoundingClientRect();
+  const rect = _canvasEl.getBoundingClientRect();
   node.x = Math.max(0, (e.clientX - rect.left) / zoomLevel - dragOX);
   node.y = Math.max(0, (e.clientY - rect.top)  / zoomLevel - dragOY);
   const el = document.getElementById(dragNodeId);
@@ -963,17 +1043,16 @@ document.addEventListener('mouseup', () => {
   }
 });
 
-document.getElementById('canvas-wrap').addEventListener('mousemove', e => {
-  const ghost = document.getElementById('ghost');
-  if (!selectedTool) { ghost.style.display = 'none'; return; }
-  const rect = document.getElementById('canvas').getBoundingClientRect();
-  ghost.style.display = 'block';
-  ghost.style.left = ((e.clientX - rect.left) / zoomLevel - parseInt(ghost.style.width||'70')/2) + 'px';
-  ghost.style.top  = ((e.clientY - rect.top)  / zoomLevel - parseInt(ghost.style.height||'50')/2) + 'px';
+_canvasWrap.addEventListener('mousemove', e => {
+  if (!selectedTool) { _ghostEl.style.display = 'none'; return; }
+  const rect = _canvasEl.getBoundingClientRect();
+  _ghostEl.style.display = 'block';
+  _ghostEl.style.left = ((e.clientX - rect.left) / zoomLevel - parseInt(_ghostEl.style.width||'70')/2) + 'px';
+  _ghostEl.style.top  = ((e.clientY - rect.top)  / zoomLevel - parseInt(_ghostEl.style.height||'50')/2) + 'px';
 });
 
-document.getElementById('canvas').addEventListener('click', e => {
-  if (e.target === document.getElementById('canvas') || e.target.closest('svg#arrows')) {
+_canvasEl.addEventListener('click', e => {
+  if (e.target === _canvasEl || e.target.closest('svg#arrows')) {
     if (selectedTool) { deselectTool(); setStatus('Inserción cancelada.'); return; }
     clearNodeSel(); clearArrowSel();
   }
@@ -983,8 +1062,7 @@ document.getElementById('canvas').addEventListener('click', e => {
 //  ZOOM
 // ═══════════════════════════════════════════════════════
 function applyZoom() {
-  const canvasEl = document.getElementById('canvas');
-  canvasEl.style.transform = `scale(${zoomLevel})`;
+  _canvasEl.style.transform = `scale(${zoomLevel})`;
   document.getElementById('zoom-level').textContent = Math.round(zoomLevel * 100) + '%';
 }
 
@@ -1004,20 +1082,19 @@ function zoomReset() {
 }
 
 // Ctrl/Cmd + scroll wheel zooms in and out, anchored at the mouse position.
-document.getElementById('canvas-wrap').addEventListener('wheel', e => {
+_canvasWrap.addEventListener('wheel', e => {
   if (!(e.ctrlKey || e.metaKey)) return;
   e.preventDefault();
-  const wrap = document.getElementById('canvas-wrap');
-  const rect = wrap.getBoundingClientRect();
-  const mx = e.clientX - rect.left + wrap.scrollLeft;
-  const my = e.clientY - rect.top  + wrap.scrollTop;
+  const rect = _canvasWrap.getBoundingClientRect();
+  const mx = e.clientX - rect.left + _canvasWrap.scrollLeft;
+  const my = e.clientY - rect.top  + _canvasWrap.scrollTop;
   const oldZoom = zoomLevel;
   if (e.deltaY < 0) zoomLevel = Math.min(ZOOM_MAX, Math.round((zoomLevel + ZOOM_STEP) * 100) / 100);
   else              zoomLevel = Math.max(ZOOM_MIN, Math.round((zoomLevel - ZOOM_STEP) * 100) / 100);
   applyZoom();
   const scale = zoomLevel / oldZoom;
-  wrap.scrollLeft = mx * scale - (e.clientX - rect.left);
-  wrap.scrollTop  = my * scale - (e.clientY - rect.top);
+  _canvasWrap.scrollLeft = mx * scale - (e.clientX - rect.left);
+  _canvasWrap.scrollTop  = my * scale - (e.clientY - rect.top);
 }, { passive: false });
 
 // ═══════════════════════════════════════════════════════
@@ -1049,14 +1126,14 @@ function clearArrowSel() {
 //  EDIT LABEL
 // ═══════════════════════════════════════════════════════
 function startEditLabel(node) {
-  const canvasEl = document.getElementById('canvas');
   const inp = document.createElement('input');
   inp.className = 'node-input';
   inp.value = node.label;
-  inp.style.left  = (node.x + 4) + 'px';
-  inp.style.top   = (node.y + node.h/2 - 14) + 'px';
-  inp.style.width = Math.max(node.w - 8, 80) + 'px';
-  canvasEl.appendChild(inp);
+  inp.style.left   = (node.x + 4) + 'px';
+  inp.style.top    = (node.y + 4) + 'px';
+  inp.style.width  = Math.max(node.w - 8, 80) + 'px';
+  inp.style.height = (node.h - 8) + 'px';
+  _canvasEl.appendChild(inp);
   inp.focus(); inp.select();
 
   const done = () => {
@@ -1083,24 +1160,29 @@ function deleteSelected() {
     }
 
     if (node && node.type === 'decision') {
-      const inArrow = arrows.find(a => a.dstId === nodeId);
-      const siArrow = arrows.find(a => a.srcId === nodeId && a.srcPort === 'left');
-      const noArrow = arrows.find(a => a.srcId === nodeId && a.srcPort === 'right');
+      // Capture incoming arrow before deletion
+      const inArr = node.incoming.length ? arrows.find(a => a.id === node.incoming[0]) : null;
+      const noArrow = arrows.find(a => a.srcId === nodeId && a.srcPort === 'left');
+      const siArrow = arrows.find(a => a.srcId === nodeId && a.srcPort === 'right');
       const siBranch = siArrow ? walkBranch(siArrow) : { nodes: [], mergeId: null };
       const noBranch = noArrow ? walkBranch(noArrow) : { nodes: [], mergeId: null };
       const mergeId  = siBranch.mergeId || noBranch.mergeId;
       const branchIds = new Set([...siBranch.nodes, ...noBranch.nodes].map(n => n.id));
 
-      arrows.filter(a => a.srcId === nodeId || a.dstId === nodeId || branchIds.has(a.srcId) || branchIds.has(a.dstId))
-        .forEach(a => removeArrowEl(a.id));
-      arrows = arrows.filter(a => !(a.srcId === nodeId || a.dstId === nodeId || branchIds.has(a.srcId) || branchIds.has(a.dstId)));
+      // Remove all arrows connected to decision or any branch node via pointers
+      const affected = new Set();
+      [node, ...siBranch.nodes, ...noBranch.nodes].forEach(n => {
+        n.incoming.forEach(id => affected.add(id));
+        n.outgoing.forEach(id => affected.add(id));
+      });
+      affected.forEach(id => removeArrow(id));
 
       branchIds.forEach(id => { const e = document.getElementById(id); if (e) e.remove(); });
       const el = document.getElementById(nodeId);
       if (el) el.remove();
       nodes = nodes.filter(n => n.id !== nodeId && !branchIds.has(n.id));
 
-      if (inArrow && mergeId) mkArrow(inArrow.srcId, mergeId, '', null, null);
+      if (inArr && mergeId) mkArrow(inArr.srcId, mergeId, inArr.label || '', inArr.srcPort || null, null);
 
       selectedNodeId = null;
       autoLayout();
@@ -1108,18 +1190,22 @@ function deleteSelected() {
       return;
     }
 
-    // A merge-point node (created via insertAfterMerge, or any node two SI/NO
-    // branches converge into) has MORE THAN ONE incoming arrow. Deleting it
-    // must reconnect ALL of them to whatever followed it, not just one —
-    // otherwise the other branch is left dangling with no destination.
-    const allIncoming = arrows.filter(a => a.dstId === nodeId);
-    const outArrow = arrows.find(a => a.srcId === nodeId && (!a.srcPort || a.srcPort === 'bottom'));
+    // A merge-point node (2+ incoming arrows) must reconnect ALL of them to
+    // whatever followed it — otherwise the other branch dangles.
+    if (node.incoming.length > 1) {
+      // Capture arrow data before removal
+      const inData = node.incoming.map(id => {
+        const a = arrows.find(arr => arr.id === id);
+        return a ? { srcId: a.srcId, label: a.label, srcPort: a.srcPort, dstPort: a.dstPort } : null;
+      }).filter(Boolean);
+      const outArr = arrows.find(a => a.srcId === nodeId && (!a.srcPort || a.srcPort === 'bottom'));
+      const outDstId = outArr ? outArr.dstId : null;
 
-    if (allIncoming.length > 1) {
-      arrows.filter(a => a.srcId === nodeId || a.dstId === nodeId).forEach(a => removeArrowEl(a.id));
-      arrows = arrows.filter(a => a.srcId !== nodeId && a.dstId !== nodeId);
-      if (outArrow) {
-        allIncoming.forEach(a => mkArrow(a.srcId, outArrow.dstId, a.label, a.srcPort, a.dstPort));
+      // Remove all arrows connected to this node
+      [...node.incoming, ...node.outgoing].forEach(id => removeArrow(id));
+
+      if (outDstId) {
+        inData.forEach(d => mkArrow(d.srcId, outDstId, d.label, d.srcPort, d.dstPort));
       }
       const el = document.getElementById(nodeId);
       if (el) el.remove();
@@ -1130,19 +1216,23 @@ function deleteSelected() {
       return;
     }
 
-    const inArrow  = arrows.find(a => a.dstId === nodeId && (!a.dstPort || a.dstPort !== 'top'));
-    // A branch node sits directly after a decision's SI/NO port (dstPort === 'top',
-    // srcPort left/right) — its outgoing arrow may itself have any port, but we only
-    // need the destination it pointed to so the branch can be wired straight through.
-    const branchInArrow = arrows.find(a => a.dstId === nodeId && a.dstPort === 'top' && (a.srcPort === 'left' || a.srcPort === 'right'));
-    arrows.filter(a => a.srcId === nodeId || a.dstId === nodeId).forEach(a => removeArrowEl(a.id));
-    arrows = arrows.filter(a => a.srcId !== nodeId && a.dstId !== nodeId);
-    if (inArrow && outArrow) {
-      mkArrow(inArrow.srcId, outArrow.dstId);
-    } else if (branchInArrow && outArrow) {
-      // Reconnect the decision straight to whatever the deleted branch node led to,
-      // restoring the original SI/NO label/port so it renders as a direct branch again.
-      mkArrow(branchInArrow.srcId, outArrow.dstId, branchInArrow.label, branchInArrow.srcPort, 'top');
+    // Regular node (exactly 1 incoming arrow)
+    const inArr   = arrows.find(a => a.dstId === nodeId && (!a.dstPort || a.dstPort !== 'top'));
+    // Branch node sits directly after a decision's SI/NO port
+    const brArr   = arrows.find(a => a.dstId === nodeId && a.dstPort === 'top' && (a.srcPort === 'left' || a.srcPort === 'right'));
+    const outArr  = arrows.find(a => a.srcId === nodeId && (!a.srcPort || a.srcPort === 'bottom'));
+
+    // Capture data before removal
+    const inData  = inArr  ? { srcId: inArr.srcId } : null;
+    const brData  = brArr  ? { srcId: brArr.srcId, label: brArr.label, srcPort: brArr.srcPort } : null;
+    const outDst  = outArr ? outArr.dstId : null;
+
+    [...node.incoming, ...node.outgoing].forEach(id => removeArrow(id));
+
+    if (inData && outDst) {
+      mkArrow(inData.srcId, outDst);
+    } else if (brData && outDst) {
+      mkArrow(brData.srcId, outDst, brData.label, brData.srcPort, 'top');
     }
     const el = document.getElementById(nodeId);
     if (el) el.remove();
@@ -1151,8 +1241,7 @@ function deleteSelected() {
     autoLayout();
     setStatus('Nodo eliminado.');
   } else if (selectedArrowId) {
-    removeArrowEl(selectedArrowId);
-    arrows = arrows.filter(a => a.id !== selectedArrowId);
+    removeArrow(selectedArrowId);
     selectedArrowId = null;
     setStatus('Flecha eliminada.');
   }
@@ -1171,11 +1260,11 @@ document.addEventListener('keydown', e => {
 //  RESET — modal-based, no confirm()
 // ═══════════════════════════════════════════════════════
 function askReset() {
-  document.getElementById('modal-overlay').classList.add('show');
+  _modalOvr.classList.add('show');
 }
 
 function closeModal() {
-  document.getElementById('modal-overlay').classList.remove('show');
+  _modalOvr.classList.remove('show');
 }
 
 function doReset() {
@@ -1189,12 +1278,10 @@ function doReset() {
   document.querySelectorAll('.node-input').forEach(el => el.remove());
 
   // Remove all .node divs from canvas
-  const canvasEl = document.getElementById('canvas');
-  canvasEl.querySelectorAll('.node').forEach(el => el.remove());
+  _canvasEl.querySelectorAll('.node').forEach(el => el.remove());
 
   // Remove all arrow <g> elements from SVG (keep <defs>)
-  const svgEl = document.getElementById('arrows');
-  Array.from(svgEl.childNodes).forEach(child => {
+  Array.from(_arrowsSvg.childNodes).forEach(child => {
     if (child.nodeType === 1 && child.tagName.toLowerCase() !== 'defs') {
       child.remove();
     }
@@ -1217,7 +1304,7 @@ function doReset() {
     const btn = document.getElementById('tool-' + selectedTool);
     if (btn) btn.classList.remove('active');
     selectedTool = null;
-    document.getElementById('ghost').style.display = 'none';
+    _ghostEl.style.display = 'none';
   }
 
   // Re-init
@@ -1226,8 +1313,8 @@ function doReset() {
 }
 
 // Close modal if clicking outside box
-document.getElementById('modal-overlay').addEventListener('click', e => {
-  if (e.target === document.getElementById('modal-overlay')) closeModal();
+_modalOvr.addEventListener('click', e => {
+  if (e.target === _modalOvr) closeModal();
 });
 
 // ═══════════════════════════════════════════════════════
@@ -1235,13 +1322,19 @@ document.getElementById('modal-overlay').addEventListener('click', e => {
 // ═══════════════════════════════════════════════════════
 function saveDiagram() {
   if (!nodes.length) { setStatus('No hay nada que guardar.'); return; }
-  resetConvergeCache();
   let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
   nodes.forEach(n => {
     minX=Math.min(minX,n.x); minY=Math.min(minY,n.y);
     maxX=Math.max(maxX,n.x+n.w); maxY=Math.max(maxY,n.y+n.h);
   });
-  const pad=60, W=maxX-minX+pad*2, H=maxY-minY+pad*2, ox=minX-pad, oy=minY-pad;
+  // Include branch column positions and merge bars from decision layout
+  Object.values(decisionLayout).forEach(dl => {
+    if (dl.siCenterX != null) { minX = Math.min(minX, dl.siCenterX - MIN_W); maxX = Math.max(maxX, dl.siCenterX + MIN_W); }
+    if (dl.noCenterX != null) { minX = Math.min(minX, dl.noCenterX - MIN_W); maxX = Math.max(maxX, dl.noCenterX + MIN_W); }
+    if (dl.mergeBarY != null) { minY = Math.min(minY, dl.mergeBarY); maxY = Math.max(maxY, dl.mergeBarY + V_GAP); }
+    if (dl.mergeY    != null) { maxY = Math.max(maxY, dl.mergeY); }
+  });
+  const pad=80, W=maxX-minX+pad*2, H=maxY-minY+pad*2, ox=minX-pad, oy=minY-pad;
   let svg = `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="${ox} ${oy} ${W} ${H}">
 <defs><marker id="ah" markerWidth="8" markerHeight="5.6" refX="7.2" refY="2.8" orient="auto">
@@ -1252,25 +1345,50 @@ function saveDiagram() {
     const src=nodes.find(n=>n.id===arrow.srcId), dst=nodes.find(n=>n.id===arrow.dstId);
     if (!src||!dst) return;
 
-    const sxCx = src.x + src.w / 2, sxBy = src.y + src.h;
+    const sxCx = src.x + src.w / 2, sxBy = src.y + src.h, sxCy = src.y + src.h / 2;
     const dxCx = dst.x + dst.w / 2, dxTy = dst.y;
+    const decLeftX = src.x, decRightX = src.x + src.w;
 
-    // Detect convergence
-    const allToTop2 = arrows.filter(a => a.dstId === dst.id && a.dstPort === 'top');
-    const branches2 = allToTop2.filter(a => !!getBranchInfo(a));
-    const isConv2   = branches2.length >= 2 && branches2.some(a => a.id === arrow.id);
+    const isDecBranch2 = (arrow.srcPort === 'left' || arrow.srcPort === 'right') && src.type === 'decision';
+    const dl2 = isDecBranch2 ? decisionLayout[src.id] : null;
+
+    function getImmediateDecId2(a) {
+      const seen = new Set();
+      let cur = a;
+      while (cur && !seen.has(cur.id)) {
+        seen.add(cur.id);
+        if (cur.srcPort === 'left' || cur.srcPort === 'right') {
+          const s = nodes.find(n => n.id === cur.srcId);
+          if (s && s.type === 'decision') return s.id;
+        }
+        const incs = arrows.filter(x => x.dstId === cur.srcId);
+        if (incs.length !== 1) break;
+        cur = incs[0];
+      }
+      return null;
+    }
+
+    // Detect convergence — any destination with 2+ incoming arrows, mirroring
+    // the live-canvas logic so nested decisions (where one branch reaches dst
+    // directly and another through a second decision) still share one bar.
+    const allIncoming2 = arrows.filter(a => a.dstId === dst.id);
+    const isConv2 = allIncoming2.length >= 2;
 
     let mergeBarY2 = dst.y - 22;
     if (isConv2) {
-      let maxSB = 0;
-      branches2.forEach(a => { const s=nodes.find(n=>n.id===a.srcId); if(s) maxSB=Math.max(maxSB,s.y+s.h); });
-      mergeBarY2 = Math.min(maxSB + Math.round(V_GAP*0.4), dst.y - 22);
+      let best = -Infinity;
+      allIncoming2.forEach(a => {
+        const rootId = getImmediateDecId2(a);
+        const rdl = rootId ? decisionLayout[rootId] : null;
+        if (rdl && rdl.mergeBarY != null) best = Math.max(best, rdl.mergeBarY);
+      });
+      mergeBarY2 = best > -Infinity ? best : dst.y - Math.round(V_GAP * 1.5);
     }
 
-    let throughId2 = branches2[0]?.id;
+    let throughId2 = allIncoming2[0]?.id;
     if (isConv2) {
       let best2 = -Infinity;
-      branches2.forEach(a => {
+      allIncoming2.forEach(a => {
         const info2=getBranchInfo(a), s2=nodes.find(n=>n.id===a.srcId);
         const sc2=(info2&&info2.side==='si'?10000:0)+(s2?s2.x+s2.w/2:0);
         if(sc2>best2){best2=sc2;throughId2=a.id;}
@@ -1280,13 +1398,33 @@ function saveDiagram() {
 
     let pathD2, lx2, ly2, drawHead2=true;
 
-    if (isConv2) {
+    if (isDecBranch2) {
+      const vertexX = arrow.srcPort === 'left' ? decLeftX : decRightX;
+      const colX = dl2
+        ? (arrow.srcPort === 'left' ? dl2.noCenterX : dl2.siCenterX)
+        : (arrow.srcPort === 'left' ? src.x - 100 : src.x + src.w + 100);
+      lx2 = arrow.srcPort === 'left' ? vertexX - 28 : vertexX + 28;
+      ly2 = sxCy - 13;
+      if (isConv2) {
+        const pts = [[vertexX, sxCy], [colX, sxCy], [colX, mergeBarY2], [dxCx, mergeBarY2]];
+        if (iAmThrough2) pts.push([dxCx, dxTy]);
+        drawHead2 = iAmThrough2;
+        const npts = pts.filter((p,i,a)=>i===0||p[0]!==a[i-1][0]||p[1]!==a[i-1][1]);
+        pathD2 = 'M'+npts.map(p=>p[0]+','+p[1]).join(' L');
+      } else {
+        const turnY = dxTy - Math.round(V_GAP / 2);
+        const pts = [[vertexX, sxCy], [colX, sxCy], [colX, turnY], [dxCx, turnY], [dxCx, dxTy]];
+        const npts = pts.filter((p,i,a)=>i===0||p[0]!==a[i-1][0]||p[1]!==a[i-1][1]);
+        pathD2 = 'M'+npts.map(p=>p[0]+','+p[1]).join(' L');
+        drawHead2 = true;
+      }
+    } else if (isConv2) {
       const pts=[[sxCx,sxBy],[sxCx,mergeBarY2],[dxCx,mergeBarY2]];
       if(iAmThrough2) pts.push([dxCx,dxTy]);
       drawHead2=iAmThrough2;
       const npts=pts.filter((p,i,a)=>i===0||p[0]!==a[i-1][0]||p[1]!==a[i-1][1]);
       pathD2='M'+npts.map(p=>p[0]+','+p[1]).join(' L');
-      lx2=(sxCx+dxCx)/2; ly2=mergeBarY2-13;
+      lx2=sxCx; ly2=(sxBy+mergeBarY2)/2-8;
     } else if (Math.abs(sxCx-dxCx)<3) {
       pathD2=`M${sxCx},${sxBy} L${dxCx},${dxTy}`;
       lx2=sxCx; ly2=(sxBy+dxTy)/2-8;
@@ -1347,7 +1485,7 @@ function saveDiagram() {
 // ═══════════════════════════════════════════════════════
 //  STATUS
 // ═══════════════════════════════════════════════════════
-function setStatus(msg) { document.getElementById('status-bar').textContent = msg; }
+function setStatus(msg) { _statusBar.textContent = msg; }
 
 // ═══════════════════════════════════════════════════════
 //  INIT
